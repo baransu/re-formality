@@ -1,5 +1,19 @@
 # History
 
+## 3.0.0-beta.2
+* Add `FormalityCompat` to support `JSX@2`.
+
+## 3.0.0-beta.1
+* **[ BREAKING ]** React hooks support (`reason-react@0.7.0`).
+
+## 2.0.0
+* **[ BREAKING ]** `bs-platform` updated to `5.0.0`.
+* **[ BREAKING ]** Generalize payload of `FormStatus.SubmissionFailed` constructor ([#49](https://github.com/alexfedoseev/re-formality/pull/49)).
+* Add `dismissSubmissionError`.
+* Add `mapSubmissionError`.
+* Keep submission error on a screen (if any) while re-submitting.
+* Reset validation state to `Pristine` on successful submission ([#46](https://github.com/alexfedoseev/re-formality/pull/46) by [@steinararnason](https://github.com/steinararnason))
+
 ## 1.2.0
 * Add `dismissSubmissionResult` to `submissionCallbacks` record.
 * (Chore) Update `bs-platform`.

@@ -20,7 +20,7 @@ Reasonable form validation tool for [`reason-react`](https://reasonml.github.io/
   - [Strategies](#strategies)
 - [Usage](#usage)
   - [Form config](#form-config)
-  - [Form container](#form-container)
+  - [Form hook](#form-hook)
   - [Rendering](#rendering)
   - [Async validations](#async-validations)
   - [I18n](#i18n)
@@ -103,8 +103,8 @@ Results are emitted only after the first submission attempt. After this, results
 It takes 3 steps to implement a form:
 
 1. Define form config.
-2. Create form container.
-3. Render form container and form UI.
+2. Create form hook.
+3. Render form hook and form UI.
 
 > Code > 1000 words. Quick example for you:
 
@@ -125,6 +125,7 @@ module LoginForm = {
   };
 
   type message = string;
+  type submissionError = unit;
 
   module EmailField = {
     let update = (state, value) => {...state, email: value};
@@ -162,80 +163,67 @@ module LoginForm = {
   ];
 };
 
-module LoginFormContainer = Formality.Make(LoginForm);
+module LoginFormHook = Formality.Make(LoginForm);
 
-let component = React.statelessComponent("LoginForm");
+[@react.component]
+let make = () => {
+  let form =
+    LoginFormHook.useForm(
+      ~initialState=LoginForm.{email: "", password: ""},
+      ~onSubmit=(state, form) => {
+        // Submit form and use callbacks to update form container
+      },
+    );
 
-let make = _ => {
-  ...component,
-  render: _ =>
-    <LoginFormContainer
-      initialState={email: "", password: ""}
-      onSubmit={
-        (state, {notifyOnSuccess, notifyOnFailure, reset}) =>
-          /* Submit form and either notifyOnSuccess / notifyOnFailure / reset */
-      }>
-      ...{
-           form =>
-             <form
-               className="form"
-               onSubmit={form.submit->Formality.Dom.preventDefault}>
-               <input
-                 value={form.state.email}
-                 disabled={form.submitting}
-                 onBlur={_ => form.blur(Email)}
-                 onChange={
-                   event =>
-                     form.change(
-                       Email,
-                       LoginForm.EmailField.update(
-                         form.state,
-                         event->ReactEvent.Form.target##value,
-                       ),
-                     )
-                 }
-               />
-               {
-                 switch (Email->form.result) {
-                 | Some(Error(message)) =>
-                   <div className={Cn.make(["form-message", "failure"])}>
-                     message->React.string
-                   </div>
-                 | Some(Ok(Valid | NoValue))
-                 | None => React.null
-                 }
-               }
-               <input
-                 value={form.state.password}
-                 disabled={form.submitting}
-                 onBlur={_ => form.blur(Password)}
-                 onChange={
-                   event =>
-                     form.change(
-                       Password,
-                       LoginForm.PasswordField.update(
-                         form.state,
-                         event->ReactEvent.Form.target##value,
-                       ),
-                     )
-                 }
-               />
-               {
-                 switch (Password->form.result) {
-                 | Some(Error(message)) =>
-                   <div className={Cn.make(["form-message", "failure"])}>
-                     message->React.string
-                   </div>
-                 | Some(Ok(Valid | NoValue))
-                 | None => React.null
-                 }
-               }
-               <button disabled={form.submitting}>
-                 (form.submitting ? "Submitting..." : "Submit")->React.string
-               </button>
-             </form>
-         }
-    </LoginFormContainer>,
+  <form onSubmit={form.submit->Formality.Dom.preventDefault}>
+    <input
+      value={form.state.email}
+      disabled={form.submitting}
+      onBlur={_ => form.blur(Email)}
+      onChange={event =>
+        form.change(
+          Email,
+          LoginForm.EmailField.update(
+            form.state,
+            event->ReactEvent.Form.target##value,
+          ),
+        )
+      }
+    />
+    {switch (Email->form.result) {
+     | Some(Error(message)) =>
+       <div className={Cn.make(["form-message", "failure"])}>
+         message->React.string
+       </div>
+     | Some(Ok(Valid | NoValue))
+     | None => React.null
+     }}
+    <input
+      value={form.state.password}
+      disabled={form.submitting}
+      onBlur={_ => form.blur(Password)}
+      onChange={event =>
+        form.change(
+          Password,
+          LoginForm.PasswordField.update(
+            form.state,
+            event->ReactEvent.Form.target##value,
+          ),
+        )
+      }
+    />
+    {switch (Password->form.result) {
+     | Some(Error(message)) =>
+       <div className={Cn.make(["form-message", "failure"])}>
+         message->React.string
+       </div>
+     | Some(Ok(Valid | NoValue))
+     | None => React.null
+     }}
+    <button disabled={form.submitting}>
+      (form.submitting ? "Submitting..." : "Submit")->React.string
+    </button>
+  </form>;
 };
 ```
 
@@ -250,6 +238,7 @@ module MyForm = {
   type field;
   type state;
   type message;
+  type submissionError;
   let validators: list(validator);
 };
 ```
@@ -292,6 +281,19 @@ If you build i18n'ized app then it's going to be something like this:
 ```reason
 type message = I18n.t;
 ```
+
+#### `type submissionError`
+
+When you submit a form submission might fail, for various reasons. It might be a bad password on login attempt (expected error) or server crash (unexpected error), anything. This kind of error is specific to a form and its type describes what might go wrong on form submission.
+
+```reason
+type submissionError =
+  | UserNotFound
+  | BadPassword
+  | UnexpectedServerError;
+```
+
+Later on, on failed form submission, you will be able to pass this error to form container and provide appropriate feedback to users in UI.
 
 #### `let validators: list(validator)`
 
@@ -357,41 +359,40 @@ type validate('state, 'message) = 'state => Result.t(ok, 'message);
 
 Most of the time you need `Ok(Valid)` or `Error('message)`. You want to return `Ok(NoValue)` when optional field receives no value (e.g. `value == ""`). `Valid` and `NoValue` are explicitly differentiated since there's no reason to show success message/icon in UI when no value is provided.
 
-### Form container
+### Form hook
 
-To create form container simply do the following:
+To create form hook simply do the following:
 
 ```reason
-module MyFormContainer = Formality.Make(MyForm);
+module MyFormHook = Formality.Make(MyForm);
 ```
 
-It creates renderable React component for general form.
+It creates React `useForm` hook for general form.
 
 If you render forms with async validations, use:
 
 ```reason
 /* Async validations on change (debounced) */
-module MyAsyncFormContainer = Formality.Async.Make(MyForm);
+module MyAsyncFormHook = Formality.Async.Make(MyForm);
 
 /* Async validations on blur */
-module MyAsyncFormContainer = Formality.Async.MakeOnBlur(MyForm);
+module MyAsyncFormHook = Formality.Async.MakeOnBlur(MyForm);
 ```
 
 ### Rendering
 
-Form container accepts 4 props:
+Form hook accepts 2 arguments and returns record with everything you need to render your UI:
 
 ```reason
-render: (_) =>
-  <MyFormContainer
-    initialState={email: "", password: ""}
-    enableReinitialize=true
-    onSubmit=((state, {notifyOnSuccess, notifyOnFailure, reset}) => {
-      /* Submit form and either notifyOnSuccess / notifyOnFailure / reset */
-    })
-  >
-  ...{form => /* UI */}
-  </MyFormContainer>
+let form =
+  MyFormHook.useForm(
+    ~initialState={email: "", password: ""},
+    ~onSubmit=(state, form) => {
+      // Submit form and use callbacks to update form container
+    },
+  );
+
+// Use `form` to render your UI...
 ```
 
 #### `initialState`
@@ -409,12 +410,12 @@ This handler will be triggered on form submission (only when all validators retu
 It accepts two arguments:
 
 1. `state`: current state of a form
-2. `submissionCallbacks`: record with 3 callbacks
+2. `submissionCallbacks`: record with 4 callbacks
 
 ```reason
-type submissionCallbacks('field, 'state, 'message) = {
+type submissionCallbacks('state, 'submissionError) = {
   notifyOnSuccess: option('state) => unit,
-  notifyOnFailure: (list(('field, 'message)), option('message)) => unit,
+  notifyOnFailure: 'submissionError => unit,
   reset: unit => unit,
   dismissSubmissionResult: unit => unit,
 };
@@ -426,12 +427,9 @@ Trigger this callback when server responded with success. It accepts optional st
 
 ##### `notifyOnFailure`
 
-Trigger this callback when server responded with an error. It accepts 2 arguments:
+Trigger this callback when server responded with an error. It accepts 1 argument of type `MyForm.submissionError` (defined in form config).
 
-1. list of field-level errors
-2. optional `message`: some information not directly related to any particular field
-
-You can access this data in render via `form.status` (see below).
+You can access this data in render via `form.status` (see [`form.status`](#form-status)).
 
 ##### `reset`
 
@@ -439,13 +437,11 @@ Simply, resets a form container state.
 
 ##### `form.dismissSubmissionResult`
 
-Use it when you want to let user dismissing alerts with errors from server or success message without resetting a form.
+Use it when you want to dismiss alerts with errors from server or success message without resetting a form. See [`form.status`](#form-status) for more details.
 
-#### `form => UI`
+#### `form` record
 
-Form container accepts children as a function.
-
-`form` argument is a record that contains everything you need to render UI:
+`form` record, returned from the hook, contains everything you need to render UI:
 
 ```reason
 type form = {
@@ -459,6 +455,8 @@ type form = {
   blur: Form.field => unit,
   submit: unit => unit,
   reset: unit => unit,
+  mapSubmissionError: ('submissionError => 'submissionError) => unit,
+  dismissSubmissionError: unit => unit,
   dismissSubmissionResult: unit => unit,
 };
 ```
@@ -473,11 +471,11 @@ Form status is a variant:
 
 ```reason
 module FormStatus = {
-  type t('field, 'message) =
+  type t('error) =
     | Editing
     | Submitting
     | Submitted
-    | SubmissionFailed(list(('field, 'message)), option('message));
+    | SubmissionFailed('error);
 };
 ```
 
@@ -570,6 +568,14 @@ Resets form state.
 
 Use it when you want to let user dismissing alerts with errors from server or success message without resetting a form. Under the hood, it changes `FormStatus.Submitted` & `FormStatus.SubmissionFailed` statuses back to `FormStatus.Editing`.
 
+##### `form.mapSubmissionError`
+
+Maps over submission error. Useful for animating errors.
+
+##### `form.dismissSubmissionError`
+
+Dismissing submission error only.
+
 ### Async validations
 
 Some validations can't be performed locally, e.g. on signup, you want to validate if user's email is available or it's already taken.
@@ -652,15 +658,21 @@ validateAsync: Some(
 ),
 ```
 
-To create form container pass config to `Formality.Async.Make` functor:
+To create form hook pass config to `Formality.Async.Make` functor:
 
 ```reason
-module MyAsyncFormContainer = Formality.Async.Make(MyForm);
+module MyAsyncFormHook = Formality.Async.Make(MyForm);
 ```
 
 #### Async validations on blur
 
-If you still want to use on blur validations just add `validateAsync` props to `validators` and use `Formality.Async.MakeOnBlur` to create form container.
+<<<<<<< HEAD
+
+# If you still want to use on blur validations just add `validateAsync` props to `validators` and use `Formality.Async.MakeOnBlur` to create form container.
+
+If you still want to use on blur validations just add `validateAsync` props to `validators` and use `Formality.Async.MakeOnBlur` to create form hook.
+
+> > > > > > > upstream/hooks
 
 #### Note on defining async validators
 

@@ -1,8 +1,7 @@
-module React = ReasonReact;
-
 module Validation = Formality__Validation;
 module Strategy = Formality__Strategy;
 module FormStatus = Formality__FormStatus;
+module ReactUpdate = Formality__ReactUpdate;
 
 let defaultDebounceInterval = 700;
 
@@ -10,6 +9,7 @@ module type Form = {
   type field;
   type state;
   type message;
+  type submissionError;
   let debounceInterval: int;
   let validators: list(Validation.Async.validator(field, state, message));
 };
@@ -23,8 +23,7 @@ module Make = (Form: Form) => {
 
   type state = {
     input: Form.state,
-    initialInput: Form.state,
-    status: FormStatus.t(Form.field, Form.message),
+    status: FormStatus.t(Form.submissionError),
     fields:
       Map.t(
         Form.field,
@@ -38,23 +37,6 @@ module Make = (Form: Form) => {
   and action =
     | Change(Form.field, Form.state)
     | Blur(Form.field)
-    | InvokeDebouncedAsyncValidation(
-        Form.field,
-        Form.state,
-        (
-          (
-            Form.field,
-            Form.state,
-            React.self(state, React.noRetainedProps, action),
-          )
-        ) =>
-        unit,
-      )
-    | TriggerAsyncValidation(
-        Form.field,
-        Form.state,
-        Validation.Async.validate(Form.state, Form.message),
-      )
     | ApplyAsyncResult(
         Form.field,
         Form.state,
@@ -62,10 +44,9 @@ module Make = (Form: Form) => {
       )
     | Submit
     | SetSubmittedStatus(option(Form.state))
-    | SetSubmissionFailedStatus(
-        list((Form.field, Form.message)),
-        option(Form.message),
-      )
+    | SetSubmissionFailedStatus(Form.submissionError)
+    | MapSubmissionError(Form.submissionError => Form.submissionError)
+    | DismissSubmissionError
     | DismissSubmissionResult
     | Reset
   and debouncedAsyncValidator = {
@@ -76,14 +57,7 @@ module Make = (Form: Form) => {
     validateAsync:
       option(
         (
-          (
-            (
-              Form.field,
-              Form.state,
-              React.self(state, React.noRetainedProps, action),
-            )
-          ) =>
-          unit,
+          ((Form.field, Form.state, ReactUpdate.dispatch(action))) => unit,
           Validation.Async.equalityChecker(Form.state),
         ),
       ),
@@ -91,7 +65,7 @@ module Make = (Form: Form) => {
 
   type interface = {
     state: Form.state,
-    status: FormStatus.t(Form.field, Form.message),
+    status: FormStatus.t(Form.submissionError),
     result: Form.field => option(Validation.Result.result(Form.message)),
     dirty: unit => bool,
     validating: Form.field => bool,
@@ -99,19 +73,31 @@ module Make = (Form: Form) => {
     change: (Form.field, Form.state) => unit,
     blur: Form.field => unit,
     submit: unit => unit,
+    mapSubmissionError: (Form.submissionError => Form.submissionError) => unit,
+    dismissSubmissionError: unit => unit,
     dismissSubmissionResult: unit => unit,
     reset: unit => unit,
   };
 
-  let debounce = (~wait, fn) => {
-    let fn = ((field, data, {React.send})) =>
-      TriggerAsyncValidation(field, data, fn)->send;
+  let debounce = (~wait, validate) => {
+    let fn = ((field, input, dispatch)) =>
+      Js.Promise.(
+        input
+        ->validate
+        ->then_(
+            result => {
+              ApplyAsyncResult(field, input, result)->dispatch;
+              resolve();
+            },
+            _,
+          )
+        ->ignore
+      );
     fn->(Debouncer.make(~wait));
   };
 
   let getInitialState = input => {
     input,
-    initialInput: input,
     status: FormStatus.Editing,
     fields:
       Form.validators->List.reduce(
@@ -141,381 +127,381 @@ module Make = (Form: Form) => {
     submittedOnce: false,
   };
 
-  let component = React.reducerComponent("Formality.Form");
-  let make =
+  let useForm =
       (
-        ~enableReinitialize=false,
         ~initialState: Form.state,
         ~onSubmit:
            (
              Form.state,
-             Validation.submissionCallbacks(
-               Form.field,
-               Form.state,
-               Form.message,
-             )
+             Validation.submissionCallbacks(Form.state, Form.submissionError)
            ) =>
            unit,
-        children,
       ) => {
-    ...component,
-    initialState: () => initialState->getInitialState,
-    didUpdate: ({newSelf, oldSelf}) =>
-      if (enableReinitialize && initialState != oldSelf.state.initialInput) {
-        newSelf.send(Reset);
-      },
-    reducer: (action, state) =>
-      switch (action) {
-      | Change(field, input) =>
-        let validator = (state.validators^)->Map.get(field);
-        switch (validator) {
-        | None =>
-          React.Update({
-            ...state,
-            input,
-            fields: state.fields->Map.set(field, Dirty(Ok(Valid), Hidden)),
-          })
-        | Some(validator) =>
-          let status = state.fields->Map.get(field);
-          let result = input->(validator.validate);
-          let fields =
-            switch (validator.dependents) {
-            | None => state.fields
-            | Some(dependents) =>
-              dependents->List.reduce(
-                state.fields,
-                (fields, field) => {
-                  let status = fields->Map.get(field);
-                  switch (status) {
-                  | None
-                  | Some(Pristine)
-                  | Some(Validating)
-                  | Some(Dirty(_, Hidden)) => fields
-                  | Some(Dirty(_, Shown)) =>
-                    let validator = (state.validators^)->Map.getExn(field);
-                    fields->Map.set(
-                      field,
-                      Dirty(input->(validator.validate), Shown),
-                    );
-                  };
-                },
-              )
-            };
-          switch (validator.strategy, status, state.submittedOnce) {
-          | (_, Some(Dirty(_, Shown)), _)
-          | (_, _, true)
-          | (OnFirstChange, _, false) =>
-            switch (result, validator.validateAsync) {
-            | (_, None) =>
-              React.Update({
-                ...state,
-                input,
-                fields: fields->Map.set(field, Dirty(result, Shown)),
-              })
-            | (Ok(Valid), Some((validateAsync, _))) =>
-              React.UpdateWithSideEffects(
-                {
-                  ...state,
-                  input,
-                  fields: fields->Map.set(field, Validating),
-                },
-                ({send}) =>
-                  InvokeDebouncedAsyncValidation(field, input, validateAsync)
-                  ->send,
-              )
-            | (Ok(NoValue) | Error(_), Some(_)) =>
-              React.Update({
-                ...state,
-                input,
-                fields: fields->Map.set(field, Dirty(result, Shown)),
-              })
-            }
+    let memoizedInitialState =
+      React.useMemo1(() => initialState->getInitialState, [|initialState|]);
 
-          | (OnFirstSuccess | OnFirstSuccessOrFirstBlur, _, false) =>
-            switch (result, validator.validateAsync) {
-            | (Ok(Valid | NoValue), None) =>
-              React.Update({
-                ...state,
-                input,
-                fields: fields->Map.set(field, Dirty(result, Shown)),
-              })
-            | (Error(_), None) =>
-              React.Update({
-                ...state,
-                input,
-                fields: fields->Map.set(field, Dirty(result, Hidden)),
-              })
-
-            | (Ok(Valid), Some((validateAsync, _))) =>
-              React.UpdateWithSideEffects(
-                {
-                  ...state,
-                  input,
-                  fields: fields->Map.set(field, Validating),
-                },
-                ({send}) =>
-                  InvokeDebouncedAsyncValidation(field, input, validateAsync)
-                  ->send,
-              )
-            | (Ok(NoValue), Some(_)) =>
-              React.Update({
-                ...state,
-                input,
-                fields: fields->Map.set(field, Dirty(result, Shown)),
-              })
-            | (Error(_), Some(_)) =>
-              React.Update({
-                ...state,
-                input,
-                fields: fields->Map.set(field, Dirty(result, Hidden)),
-              })
-            }
-
-          | (OnFirstBlur | OnSubmit, _, false) =>
-            React.Update({
+    let (state, dispatch) =
+      ReactUpdate.useReducer(memoizedInitialState, (state, action) =>
+        switch (action) {
+        | Change(field, input) =>
+          let validator = (state.validators^)->Map.get(field);
+          switch (validator) {
+          | None =>
+            Update({
               ...state,
               input,
-              fields: fields->Map.set(field, Dirty(result, Hidden)),
+              fields:
+                state.fields->Map.set(field, Dirty(Ok(Valid), Hidden)),
             })
-          };
-        };
-
-      | Blur(field) =>
-        let status = state.fields->Map.get(field);
-        let validator = (state.validators^)->Map.get(field);
-        switch (status, validator) {
-        | (Some(Validating), _)
-        | (Some(Dirty(_, Shown)), Some(_) | None)
-        | (Some(Dirty(_, Hidden)), None) => React.NoUpdate
-        | (Some(Pristine) | None, None) =>
-          React.Update({
-            ...state,
-            fields: state.fields->Map.set(field, Dirty(Ok(Valid), Hidden)),
-          })
-        | (Some(Pristine | Dirty(_, Hidden)) | None, Some(validator)) =>
-          let result = state.input->(validator.validate);
-          switch (validator.strategy) {
-          | OnFirstChange
-          | OnFirstSuccess
-          | OnSubmit =>
-            React.Update({
-              ...state,
-              fields: state.fields->Map.set(field, Dirty(result, Hidden)),
-            })
-          | OnFirstBlur
-          | OnFirstSuccessOrFirstBlur =>
-            switch (result, validator.validateAsync) {
-            | (_, None) =>
-              React.Update({
-                ...state,
-                fields: state.fields->Map.set(field, Dirty(result, Shown)),
-              })
-            | (Ok(Valid), Some((validateAsync, _))) =>
-              React.UpdateWithSideEffects(
-                {...state, fields: state.fields->Map.set(field, Validating)},
-                ({send}) =>
-                  InvokeDebouncedAsyncValidation(
-                    field,
-                    state.input,
-                    validateAsync,
-                  )
-                  ->send,
-              )
-            | (Ok(NoValue) | Error(_), Some(_)) =>
-              React.Update({
-                ...state,
-                fields: state.fields->Map.set(field, Dirty(result, Shown)),
-              })
-            }
-          };
-        };
-
-      | InvokeDebouncedAsyncValidation(field, input, validateAsync) =>
-        React.SideEffects(self => (field, input, self)->validateAsync)
-
-      | TriggerAsyncValidation(field, input, validateAsync) =>
-        React.SideEffects(
-          ({send}) =>
-            Js.Promise.(
-              input
-              ->validateAsync
-              ->then_(
-                  result => {
-                    ApplyAsyncResult(field, input, result)->send;
-                    resolve();
-                  },
-                  _,
-                )
-              ->ignore
-            ),
-        )
-
-      | ApplyAsyncResult(field, input, result) =>
-        let validator = (state.validators^)->Map.getExn(field);
-        let eq = validator.validateAsync->Option.getExn->snd;
-        if (input->eq(state.input)) {
-          React.Update({
-            ...state,
-            fields: state.fields->Map.set(field, Dirty(result, Shown)),
-          });
-        } else {
-          React.NoUpdate;
-        };
-
-      | Submit =>
-        switch (state.status) {
-        | Submitting => React.NoUpdate
-        | Editing
-        | Submitted
-        | SubmissionFailed(_, _) =>
-          let (valid, fields, validating) =
-            (state.validators^)
-            ->Map.reduce(
-                (true, state.fields, false),
-                ((valid, fields, validating), field, validator) => {
-                  let status = fields->Map.get(field);
-                  switch (status) {
-                  | _ when validating => (valid, fields, true)
-                  | Some(Validating) => (valid, fields, true)
-                  | Some(_)
-                  | None =>
-                    let currentResultIsInvalid =
-                      switch (status) {
-                      | Some(Dirty(Error(_), _)) => true
-                      | Some(Dirty(Ok(_), _) | Pristine | Validating)
-                      | None => false
-                      };
-                    let result = state.input->(validator.validate);
-                    let fields =
-                      switch (
-                        currentResultIsInvalid,
-                        result,
-                        validator.validateAsync,
-                      ) {
-                      | (true, Ok(Valid), Some(_)) => fields
-                      | (_, _, _) =>
-                        fields->Map.set(field, Dirty(result, Shown))
-                      };
-                    switch (valid, fields->Map.get(field)) {
-                    | (false, _)
-                    | (true, Some(Dirty(Error(_), _))) => (
-                        false,
-                        fields,
-                        false,
-                      )
-                    | (
-                        true,
-                        Some(
-                          Dirty(Ok(Valid | NoValue), _) | Pristine |
-                          Validating,
-                        ),
-                      )
-                    | (true, None) => (true, fields, false)
+          | Some(validator) =>
+            let status = state.fields->Map.get(field);
+            let result = input->(validator.validate);
+            let fields =
+              switch (validator.dependents) {
+              | None => state.fields
+              | Some(dependents) =>
+                dependents->List.reduce(
+                  state.fields,
+                  (fields, field) => {
+                    let status = fields->Map.get(field);
+                    switch (status) {
+                    | None
+                    | Some(Pristine)
+                    | Some(Validating)
+                    | Some(Dirty(_, Hidden)) => fields
+                    | Some(Dirty(_, Shown)) =>
+                      let validator = (state.validators^)->Map.getExn(field);
+                      fields->Map.set(
+                        field,
+                        Dirty(input->(validator.validate), Shown),
+                      );
                     };
-                  };
-                },
-              );
-          if (validating) {
-            React.NoUpdate;
-          } else if (valid) {
-            React.UpdateWithSideEffects(
-              {
-                ...state,
-                fields,
-                status: FormStatus.Submitting,
-                submittedOnce: true,
-              },
-              ({state, send}) =>
-                state.input
-                ->onSubmit({
-                    notifyOnSuccess: data => data->SetSubmittedStatus->send,
-                    notifyOnFailure: (fieldLevelErrors, serverMessage) =>
-                      SetSubmissionFailedStatus(
-                        fieldLevelErrors,
-                        serverMessage,
-                      )
-                      ->send,
-                    reset: () => Reset->send,
-                    dismissSubmissionResult: () =>
-                      DismissSubmissionResult->send,
-                  }),
-            );
-          } else {
-            React.Update({
-              ...state,
-              fields,
-              status: FormStatus.Editing,
-              submittedOnce: true,
-            });
-          };
-        }
-
-      | SetSubmittedStatus(data) =>
-        switch (data) {
-        | Some(data) =>
-          React.Update({...state, input: data, status: FormStatus.Submitted})
-        | None => React.Update({...state, status: FormStatus.Submitted})
-        }
-
-      | SetSubmissionFailedStatus(fieldLevelErrors, serverMessage) =>
-        React.Update({
-          ...state,
-          status:
-            FormStatus.SubmissionFailed(fieldLevelErrors, serverMessage),
-        })
-
-      | DismissSubmissionResult =>
-        switch (state.status) {
-        | Editing
-        | Submitting => React.NoUpdate
-        | Submitted
-        | SubmissionFailed(_, _) =>
-          React.Update({...state, status: FormStatus.Editing})
-        }
-
-      | Reset => React.Update(initialState->getInitialState)
-      },
-
-    render: ({state, send}) =>
-      children({
-        state: state.input,
-        status: state.status,
-        result: field =>
-          switch (state.fields->Map.get(field)) {
-          | None
-          | Some(Pristine)
-          | Some(Validating)
-          | Some(Dirty(_, Hidden)) => None
-          | Some(Dirty(result, Shown)) => Some(result)
-          },
-        dirty: () =>
-          state.fields
-          ->Map.some((_, status) =>
-              switch (status) {
-              | Dirty(_)
-              | Validating => true
-              | Pristine => false
+                  },
+                )
+              };
+            switch (validator.strategy, status, state.submittedOnce) {
+            | (_, Some(Dirty(_, Shown)), _)
+            | (_, _, true)
+            | (OnFirstChange, _, false) =>
+              switch (result, validator.validateAsync) {
+              | (_, None) =>
+                Update({
+                  ...state,
+                  input,
+                  fields: fields->Map.set(field, Dirty(result, Shown)),
+                })
+              | (Ok(Valid), Some((validateAsync, _))) =>
+                UpdateWithSideEffects(
+                  {
+                    ...state,
+                    input,
+                    fields: fields->Map.set(field, Validating),
+                  },
+                  ({dispatch}) => validateAsync((field, input, dispatch)),
+                )
+              | (Ok(NoValue) | Error(_), Some(_)) =>
+                Update({
+                  ...state,
+                  input,
+                  fields: fields->Map.set(field, Dirty(result, Shown)),
+                })
               }
-            ),
-        validating: field =>
-          switch (state.fields->Map.get(field)) {
-          | Some(Validating) => true
-          | None
-          | Some(Pristine)
-          | Some(Dirty(_)) => false
-          },
-        submitting:
+
+            | (OnFirstSuccess | OnFirstSuccessOrFirstBlur, _, false) =>
+              switch (result, validator.validateAsync) {
+              | (Ok(Valid | NoValue), None) =>
+                Update({
+                  ...state,
+                  input,
+                  fields: fields->Map.set(field, Dirty(result, Shown)),
+                })
+              | (Error(_), None) =>
+                Update({
+                  ...state,
+                  input,
+                  fields: fields->Map.set(field, Dirty(result, Hidden)),
+                })
+
+              | (Ok(Valid), Some((validateAsync, _))) =>
+                UpdateWithSideEffects(
+                  {
+                    ...state,
+                    input,
+                    fields: fields->Map.set(field, Validating),
+                  },
+                  ({dispatch}) => validateAsync((field, input, dispatch)),
+                )
+              | (Ok(NoValue), Some(_)) =>
+                Update({
+                  ...state,
+                  input,
+                  fields: fields->Map.set(field, Dirty(result, Shown)),
+                })
+              | (Error(_), Some(_)) =>
+                Update({
+                  ...state,
+                  input,
+                  fields: fields->Map.set(field, Dirty(result, Hidden)),
+                })
+              }
+
+            | (OnFirstBlur | OnSubmit, _, false) =>
+              Update({
+                ...state,
+                input,
+                fields: fields->Map.set(field, Dirty(result, Hidden)),
+              })
+            };
+          };
+
+        | Blur(field) =>
+          let status = state.fields->Map.get(field);
+          let validator = (state.validators^)->Map.get(field);
+          switch (status, validator) {
+          | (Some(Validating), _)
+          | (Some(Dirty(_, Shown)), Some(_) | None)
+          | (Some(Dirty(_, Hidden)), None) => NoUpdate
+          | (Some(Pristine) | None, None) =>
+            Update({
+              ...state,
+              fields:
+                state.fields->Map.set(field, Dirty(Ok(Valid), Hidden)),
+            })
+          | (Some(Pristine | Dirty(_, Hidden)) | None, Some(validator)) =>
+            let result = state.input->(validator.validate);
+            switch (validator.strategy) {
+            | OnFirstChange
+            | OnFirstSuccess
+            | OnSubmit =>
+              Update({
+                ...state,
+                fields: state.fields->Map.set(field, Dirty(result, Hidden)),
+              })
+            | OnFirstBlur
+            | OnFirstSuccessOrFirstBlur =>
+              switch (result, validator.validateAsync) {
+              | (_, None) =>
+                Update({
+                  ...state,
+                  fields: state.fields->Map.set(field, Dirty(result, Shown)),
+                })
+              | (Ok(Valid), Some((validateAsync, _))) =>
+                UpdateWithSideEffects(
+                  {
+                    ...state,
+                    fields: state.fields->Map.set(field, Validating),
+                  },
+                  ({dispatch}) =>
+                    validateAsync((field, state.input, dispatch)),
+                )
+              | (Ok(NoValue) | Error(_), Some(_)) =>
+                Update({
+                  ...state,
+                  fields: state.fields->Map.set(field, Dirty(result, Shown)),
+                })
+              }
+            };
+          };
+
+        | ApplyAsyncResult(field, input, result) =>
+          let validator = (state.validators^)->Map.getExn(field);
+          let eq = validator.validateAsync->Option.getExn->snd;
+          if (input->eq(state.input)) {
+            Update({
+              ...state,
+              fields: state.fields->Map.set(field, Dirty(result, Shown)),
+            });
+          } else {
+            NoUpdate;
+          };
+
+        | Submit =>
           switch (state.status) {
-          | Submitting => true
+          | Submitting(_) => NoUpdate
           | Editing
           | Submitted
-          | SubmissionFailed(_, _) => false
-          },
-        change: (field, state) => Change(field, state)->send,
-        blur: field => Blur(field)->send,
-        submit: () => Submit->send,
-        dismissSubmissionResult: () => DismissSubmissionResult->send,
-        reset: () => Reset->send,
-      }),
+          | SubmissionFailed(_) =>
+            let (valid, fields, validating) =
+              (state.validators^)
+              ->Map.reduce(
+                  (true, state.fields, false),
+                  ((valid, fields, validating), field, validator) => {
+                    let status = fields->Map.get(field);
+                    switch (status) {
+                    | _ when validating => (valid, fields, true)
+                    | Some(Validating) => (valid, fields, true)
+                    | Some(_)
+                    | None =>
+                      let currentResultIsInvalid =
+                        switch (status) {
+                        | Some(Dirty(Error(_), _)) => true
+                        | Some(Dirty(Ok(_), _) | Pristine | Validating)
+                        | None => false
+                        };
+                      let result = state.input->(validator.validate);
+                      let fields =
+                        switch (
+                          currentResultIsInvalid,
+                          result,
+                          validator.validateAsync,
+                        ) {
+                        | (true, Ok(Valid), Some(_)) => fields
+                        | (_, _, _) =>
+                          fields->Map.set(field, Dirty(result, Shown))
+                        };
+                      switch (valid, fields->Map.get(field)) {
+                      | (false, _)
+                      | (true, Some(Dirty(Error(_), _))) => (
+                          false,
+                          fields,
+                          false,
+                        )
+                      | (
+                          true,
+                          Some(
+                            Dirty(Ok(Valid | NoValue), _) | Pristine |
+                            Validating,
+                          ),
+                        )
+                      | (true, None) => (true, fields, false)
+                      };
+                    };
+                  },
+                );
+            if (validating) {
+              NoUpdate;
+            } else if (valid) {
+              UpdateWithSideEffects(
+                {
+                  ...state,
+                  fields,
+                  status:
+                    FormStatus.Submitting(
+                      switch (state.status) {
+                      | SubmissionFailed(error) => Some(error)
+                      | Editing
+                      | Submitted
+                      | Submitting(_) => None
+                      },
+                    ),
+                  submittedOnce: true,
+                },
+                ({state, dispatch}) =>
+                  state.input
+                  ->onSubmit({
+                      notifyOnSuccess: data =>
+                        data->SetSubmittedStatus->dispatch,
+                      notifyOnFailure: error =>
+                        SetSubmissionFailedStatus(error)->dispatch,
+                      reset: () => Reset->dispatch,
+                      dismissSubmissionResult: () =>
+                        DismissSubmissionResult->dispatch,
+                    }),
+              );
+            } else {
+              Update({
+                ...state,
+                fields,
+                status: FormStatus.Editing,
+                submittedOnce: true,
+              });
+            };
+          }
+
+        | SetSubmittedStatus(data) =>
+          switch (data) {
+          | Some(data) =>
+            Update({
+              ...state,
+              input: data,
+              status: FormStatus.Submitted,
+              fields: state.fields->Map.map(_ => Validation.Async.Pristine),
+            })
+          | None =>
+            Update({
+              ...state,
+              status: FormStatus.Submitted,
+              fields: state.fields->Map.map(_ => Validation.Async.Pristine),
+            })
+          }
+
+        | SetSubmissionFailedStatus(error) =>
+          Update({...state, status: FormStatus.SubmissionFailed(error)})
+
+        | MapSubmissionError(map) =>
+          switch (state.status) {
+          | Submitting(Some(error)) =>
+            Update({...state, status: Submitting(Some(error->map))})
+          | SubmissionFailed(error) =>
+            Update({...state, status: SubmissionFailed(error->map)})
+          | Editing
+          | Submitting(None)
+          | Submitted => NoUpdate
+          }
+
+        | DismissSubmissionError =>
+          switch (state.status) {
+          | Editing
+          | Submitting(_)
+          | Submitted => NoUpdate
+          | SubmissionFailed(_) =>
+            Update({...state, status: FormStatus.Editing})
+          }
+
+        | DismissSubmissionResult =>
+          switch (state.status) {
+          | Editing
+          | Submitting(_) => NoUpdate
+          | Submitted
+          | SubmissionFailed(_) =>
+            Update({...state, status: FormStatus.Editing})
+          }
+
+        | Reset => Update(initialState->getInitialState)
+        }
+      );
+
+    {
+      state: state.input,
+      status: state.status,
+      result: field =>
+        switch (state.fields->Map.get(field)) {
+        | None
+        | Some(Pristine)
+        | Some(Validating)
+        | Some(Dirty(_, Hidden)) => None
+        | Some(Dirty(result, Shown)) => Some(result)
+        },
+      dirty: () =>
+        state.fields
+        ->Map.some((_, status) =>
+            switch (status) {
+            | Dirty(_)
+            | Validating => true
+            | Pristine => false
+            }
+          ),
+      validating: field =>
+        switch (state.fields->Map.get(field)) {
+        | Some(Validating) => true
+        | None
+        | Some(Pristine)
+        | Some(Dirty(_)) => false
+        },
+      submitting:
+        switch (state.status) {
+        | Submitting(_) => true
+        | Editing
+        | Submitted
+        | SubmissionFailed(_) => false
+        },
+      change: (field, state) => Change(field, state)->dispatch,
+      blur: field => Blur(field)->dispatch,
+      submit: () => Submit->dispatch,
+      mapSubmissionError: map => MapSubmissionError(map)->dispatch,
+      dismissSubmissionError: () => DismissSubmissionError->dispatch,
+      dismissSubmissionResult: () => DismissSubmissionResult->dispatch,
+      reset: () => Reset->dispatch,
+    };
   };
 };
