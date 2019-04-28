@@ -8,7 +8,6 @@ module type Form = {
   type state;
   type message;
   type submissionError;
-  let validators: list(Validation.validator(field, state, message));
 };
 
 module Make = (Form: Form) => {
